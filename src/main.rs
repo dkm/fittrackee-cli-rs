@@ -21,10 +21,11 @@ use fitparser::profile::field_types::MesgNum;
 use fitparser::Value;
 use reqwest::header::AUTHORIZATION;
 use reqwest::{multipart, Body};
-use serde::{Deserialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::process::Command;
 use tempfile::NamedTempFile;
+use thiserror::Error;
 use tokio::fs::File;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
@@ -48,20 +49,20 @@ impl Drop for Workout {
 }
 
 impl Workout {
-    fn from_gpx(gpxfile: &str, activity: &str) -> Self {
-        Workout {
+    fn from_gpx(gpxfile: &str, activity: &str) -> Result<Self, Error> {
+        Ok(Workout {
             gpxfile: Some(String::from(gpxfile)),
             fitfile: None,
             activity: Some(String::from(activity)),
-        }
+        })
     }
 
-    fn from_fit(fitfile: &str) -> Self {
-        let mut file = std::fs::File::open(fitfile).unwrap();
+    fn from_fit(fitfile: &str) -> Result<Self, Error> {
+        let mut file = std::fs::File::open(fitfile)?;
         let mut activity = None;
 
         println!("FIT parsed");
-        for data in fitparser::from_reader(&mut file).unwrap() {
+        for data in fitparser::from_reader(&mut file)? {
             if data.kind() == MesgNum::Sport {
                 for field in data.into_vec() {
                     if field.name().eq("name") {
@@ -72,8 +73,8 @@ impl Workout {
                 }
             }
         }
-        let tmpfile = NamedTempFile::new().unwrap();
-        let (_, path) = tmpfile.keep().unwrap();
+        let tmpfile = NamedTempFile::new()?;
+        let (_, path) = tmpfile.keep()?;
 
         Command::new("gpsbabel")
             .args([
@@ -84,16 +85,18 @@ impl Workout {
                 "-o",
                 "gpx",
                 "-F",
-                path.as_path().to_str().unwrap(),
+                path.as_path().to_str().ok_or(Error::CatchAllError)?,
             ])
             .output()
             .expect("failed to execute process");
 
-        Workout {
-            gpxfile: Some(String::from(path.as_path().to_str().unwrap())),
+        Ok(Workout {
+            gpxfile: Some(String::from(
+                path.as_path().to_str().ok_or(Error::CatchAllError)?,
+            )),
             fitfile: Some(String::from(fitfile)),
             activity,
-        }
+        })
     }
 }
 
@@ -142,12 +145,46 @@ struct Credential {
     password: String,
 }
 
+#[derive(Debug, Error)]
 enum Error {
-    Bad,
+    #[error("Unknown sport")]
+    UnknownSport,
+
+    #[error("Catchall error")]
+    CatchAllError,
+
+    #[error("Reqwest error")]
+    ReqwestError {
+        #[from]
+        source: reqwest::Error,
+    },
+    #[error("IO error")]
+    IoError {
+        #[from]
+        source: std::io::Error,
+    },
+
+    #[error("Serde error")]
+    SerdeError {
+        #[from]
+        source: serde_json::Error,
+    },
+
+    #[error("FIT parser error")]
+    FITParserError {
+        #[from]
+        source: fitparser::Error,
+    },
+
+    #[error("tempfile error")]
+    TempfileError {
+        #[from]
+        source: tempfile::PersistError,
+    },
 }
 
 impl Trackee {
-    async fn login(login: &str, password: &str) -> Result<Trackee, ()> {
+    async fn login(login: &str, password: &str) -> Result<Trackee, Error> {
         let sport_data = std::fs::read_to_string("./map.json").expect("Unable to read file");
 
         let sport_map =
@@ -163,11 +200,10 @@ impl Trackee {
             .post("http://localhost:5000/api/auth/login")
             .json(&map)
             .send()
-            .await
-            .unwrap()
+            .await?
             .json::<HashMap<String, String>>()
-            .await
-            .unwrap();
+            .await?;
+
         let token = resp.get("auth_token").unwrap();
         println!("{}", token);
 
@@ -177,12 +213,15 @@ impl Trackee {
         })
     }
 
-    async fn add_workout(&self, workout: &Workout, notes: &str) {
+    async fn add_workout(&self, workout: &Workout, notes: &str) -> Result<(), Error> {
         let sport_name = workout.get_activity();
-        let sport_id = self.get_sport_id(sport_name).await.unwrap();
+        let sport_id = self
+            .get_sport_id(sport_name)
+            .await
+            .ok_or(Error::UnknownSport)?;
 
         println!("Found {}:{}", sport_name, sport_id);
-        let file = File::open(workout.get_gpx_filepath()).await.unwrap();
+        let file = File::open(workout.get_gpx_filepath()).await?;
 
         // read file body stream
         let stream = FramedRead::new(file, BytesCodec::new());
@@ -191,8 +230,7 @@ impl Trackee {
         //make form part of file
         let some_file = multipart::Part::stream(file_body)
             .file_name("test.gpx")
-            .mime_str("text/plain")
-            .unwrap();
+            .mime_str("text/plain")?;
 
         let form = multipart::Form::new()
             .text(
@@ -206,10 +244,11 @@ impl Trackee {
             .post("http://localhost:5000/api/workouts")
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .multipart(form)
-            .build()
-            .unwrap();
+            .build()?;
 
-        let _resp = client.execute(resp).await.unwrap();
+        let _resp = client.execute(resp).await?;
+
+        Ok(())
     }
 
     async fn get_sport_id(&self, sport_name: &str) -> Option<u8> {
@@ -224,22 +263,22 @@ impl Trackee {
 
         self.get_sports()
             .await
+            .ok()?
             .into_iter()
             .find(|x| x.label.eq(lookup))
             .map(|x| x.id)
     }
 
-    async fn get_sports(&self) -> Vec<Sport> {
+    async fn get_sports(&self) -> Result<Vec<Sport>, Error> {
         let client = reqwest::Client::new();
         let resp = client
             .get("http://localhost:5000/api/sports")
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .send()
-            .await
-            .unwrap();
+            .await?;
 
-        let resp = resp.json::<FittrackeeResponse<OnlySport>>().await.unwrap();
-        resp.data.sports
+        let resp = resp.json::<RSports>().await?;
+        Ok(resp.data.sports)
     }
 }
 
@@ -260,11 +299,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_matches();
 
     let workout = if let Some(fit_file) = matches.get_one::<String>("fit") {
-        Workout::from_fit(fit_file)
+        Workout::from_fit(fit_file)?
     } else {
         let gpx_file = matches.get_one::<String>("gpx").unwrap();
         let sport_name = matches.get_one::<String>("sport").unwrap();
-        Workout::from_gpx(gpx_file, sport_name)
+        Workout::from_gpx(gpx_file, sport_name)?
     };
 
     let notes = matches.get_one::<String>("notes").unwrap();
@@ -284,11 +323,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .unwrap();
 
-        for s in trackee.get_sports().await.into_iter().map(|x| x.label) {
+        for s in trackee.get_sports().await?.into_iter().map(|x| x.label) {
             println!("sport : {}", s);
         }
 
-        trackee.add_workout(&workout, notes).await;
+        trackee.add_workout(&workout, notes).await?;
     }
     Ok(())
 }
